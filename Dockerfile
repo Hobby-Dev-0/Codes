@@ -1,278 +1,71 @@
-namespace Hidden\HackCodegen;
+ MADE BY AMAN PANDY DONT KANG OR GET READY TO (You Can Understand)
+# We're using Alpine stable
+FROM alpine:edge
 
-use namespace HH\Lib\{Str, Vec};
+#
+# We have to uncomment Community repo for some packages
+#
+RUN sed -e 's;^#http\(.*\)/v3.9/community;http\1/v3.9/community;g' -i /etc/apk/repositories
 
-/**
- * Base class to generate a function or a method.
- */
-abstract class CodegenFunctionish implements ICodeBuilderRenderer {
+# Installing Python 
+RUN apk add --no-cache --update \
+    git \
+    bash \
+    libffi-dev \
+    openssl-dev \
+    bzip2-dev \
+    zlib-dev \
+    readline-dev \
+    sqlite-dev \
+    build-base \
+    python3
 
-  use HackBuilderRenderer;
-  use CodegenWithAttributes;
+RUN python3 -m ensurepip \
+    && pip3 install --upgrade pip setuptools \
+    && rm -r /usr/lib/python*/ensurepip && \
+    if [ ! -e /usr/bin/pip ]; then ln -s pip3 /usr/bin/pip ; fi && \
+    if [[ ! -e /usr/bin/python ]]; then ln -sf /usr/bin/python3 /usr/bin/python; fi && \
+    rm -r /root/.cache
 
-  protected string $name;
-  protected ?string $body = null;
-  protected ?string $docBlock = null;
-  protected ?string $returnType = null;
-  private ?string $fixme = null;
-  protected bool $isAsync = false;
-  protected bool $isOverride = false;
-  protected bool $isManualBody = false;
-  protected bool $isMemoized = false;
-  protected vec<string> $parameters = vec[];
-  protected ?CodegenGeneratedFrom $generatedFrom;
 
-  public function __construct(
-    protected IHackCodegenConfig $config,
-    string $name,
-  ) {
-    $this->name = $name;
-  }
+#
+# Install all the required packages
+#
+RUN apk --no-cache add build-base
 
-  public function setName(string $name): this {
-    $this->name = $name;
-    return $this;
-  }
+RUN apk add --no-cache \
+    py-pillow py-requests \
+    py-sqlalchemy py-psycopg2 git py-lxml \
+    libxslt-dev py-pip libxml2 libxml2-dev \
+    libpq postgresql-dev \
+    postgresql build-base linux-headers \
+    jpeg-dev curl neofetch git sudo \
+    gcc python-dev python3-dev \
+    postgresql postgresql-client php-pgsql \
+    musl postgresql-dev py-tz py3-aiohttp
+RUN apk add --no-cache sqlite figlet libwebp-dev
 
-  public function setIsAsync(bool $value = true): this {
-    $this->isAsync = $value;
-    return $this;
-  }
+# Copy Python Requirements to /app
+RUN git clone https://github.com/psycopg/psycopg2 psycopg2 \
+&& cd psycopg2 \
+&& python setup.py install
 
-  public function setIsMemoized(bool $value = true): this {
-    $this->isMemoized = $value;
-    return $this;
-  }
-
-  public function setReturnType(string $type): this {
-    return $this->setReturnTypef('%s', $type);
-  }
-
-  public function setReturnTypef(
-    Str\SprintfFormatString $type,
-    mixed ...$args
-  ): this {
-    $type = \vsprintf($type, $args);
-    if ($type) {
-      $this->returnType = $type;
-    }
-    return $this;
-  }
-
-  public function addParameter(string $param): this {
-    return $this->addParameterf('%s', $param);
-  }
-
-  public function addParameterf(
-    Str\SprintfFormatString $param,
-    mixed ...$args
-  ): this {
-    $param = \vsprintf($param, $args);
-    $this->parameters[] = $param;
-    return $this;
-  }
-
-  public function addParameters(Traversable<string> $params): this {
-    foreach ($params as $param) {
-      $this->addParameter($param);
-    }
-    return $this;
-  }
-
-  public function setBody(string $body): this {
-    return $this->setBodyf('%s', $body);
-  }
-
-  public function setBodyf(
-    Str\SprintfFormatString $body,
-    mixed ...$args
-  ): this {
-    $this->body = \vsprintf($body, $args);
-
-    return $this;
-  }
-
-  public function setManualBody(bool $val = true): this {
-    if ($val) {
-      if ($this->body === null) {
-        $this->body = "throw new ViolationException('Unimplemented');";
-      }
-    }
-    $this->isManualBody = $val;
-    return $this;
-  }
-
-  public function setDocBlock(string $comment): this {
-    $this->docBlock = $comment;
-    return $this;
-  }
-
-  public function setGeneratedFrom(CodegenGeneratedFrom $from): this {
-    $this->generatedFrom = $from;
-    return $this;
-  }
-
-  public function getName(): string {
-    return $this->name;
-  }
-
-  public function getParameters(): vec<string> {
-    return $this->parameters;
-  }
-
-  public function getReturnType(): ?string {
-    return $this->returnType;
-  }
-
-  public function isManualBody(): bool {
-    return $this->isManualBody;
-  }
-
-  /**
-   * Break lines for function declaration. First calculate the string length as
-   * if there were no line break. If the string exceeds one line, try break
-   * by having each parameter per line.
-   *
-   * $is_abstract - only valid for CodegenMethodX for code reuse purposes
-   */
-  protected function getFunctionDeclarationBase(
-    string $keywords,
-    bool $is_abstract = false,
-  ): string {
-    $builder = (new HackBuilder($this->config))
-      ->add($keywords)
-      ->addf('%s(%s)', $this->name, Str\join($this->parameters, ', '))
-      ->addIf($this->returnType !== null, ': '.($this->returnType ?? ''));
-
-    $code = $builder->getCode();
-
-    // If the total length is longer than max len, try to break it. Otherwise
-    // return Total length = 2 (indent) + codelength + 2 or 1 (" {" or ";")
-    // If the function/method is abstract, the ";" will be appended later
-    // Therefore it has one char less than non-abstract functions, which has "{"
-    if (
-      Str\length($code) <=
-        $this->config->getMaxLineLength() - 4 + (int)$is_abstract ||
-      $this->fixme !== null
-    ) {
-      return (new HackBuilder($this->config))->add($code)->getCode();
-    } else {
-      $parameter_lines = Vec\map(
-        $this->parameters,
-        $line ==> {
-          if (Str\search($line, '...$') !== null) {
-            return $line;
-          }
-          return $line.',';
-        },
-      );
-
-      $multi_line_builder = (new HackBuilder($this->config))
-        ->add($keywords)
-        ->addLine($this->name.'(')
-        ->indent()
-        ->addLines($parameter_lines)
-        ->unindent()
-        ->add(')')
-        ->addIf($this->returnType !== null, ': '.($this->returnType ?? ''));
-
-      return $multi_line_builder->getCode();
-    }
-  }
-
-  protected function getMaxCodeLength(): int {
-    $max_length = $this->config->getMaxLineLength();
-    if ($this is CodegenMethodish) {
-      $max_length -= $this->config->getSpacesPerIndentation();
-    }
-    return $max_length;
-  }
-
-  public function addHHFixMe(int $code, string $why): this {
-    $max_length = $this->getMaxCodeLength() - 6;
-    $str = \sprintf('HH_FIXME[%d] %s', $code, $why);
-    invariant(
-      \strlen($str) <= $max_length,
-      'ERROR: Your fixme has to fit on one line, with indentation '.
-      'and comments. So you need to shorten your message by %d '.
-      'characters.',
-      \strlen($str) - $max_length,
-    );
-    $this->fixme = $str;
-    return $this;
-  }
-
-  /**
-   * $is_abstract and $containing_class_name
-   * only valid for CodegenMethodX for code reuse purposes
-   */
-  protected function appendToBuilderBase(
-    HackBuilder $builder,
-    string $func_declaration,
-    bool $is_abstract = false,
-    string $containing_class_name = '',
-  ): HackBuilder {
-    if ($this->docBlock !== null && $this->docBlock !== '') {
-      if ($this->generatedFrom) {
-        $builder->addDocBlock(
-          $this->docBlock."\n(".$this->generatedFrom->render().')',
-        );
-      } else {
-        $builder->addDocBlock($this->docBlock);
-      }
-    } else {
-      if ($this->generatedFrom) {
-        $builder->addInlineComment($this->generatedFrom->render());
-      }
-    }
-    if ($this->hasAttributes()) {
-      $builder->ensureNewLine()->addLine($this->renderAttributes());
-    }
-    if ($this->fixme !== null) {
-      $builder->addInlineCommentWithStars($this->fixme);
-    }
-    $builder->add($func_declaration);
-
-    if ($is_abstract) {
-      $builder->addLine(';');
-      return $builder;
-    }
-
-    $builder->openBrace();
-    if ($this->isManualBody) {
-      $builder->startManualSection($containing_class_name.$this->name);
-      $builder->add($this->body);
-      $builder->endManualSection();
-    } else {
-      $builder->add($this->body);
-    }
-    $builder->closeBrace();
-    return $builder;
-  }
-
-  protected function getExtraAttributes(): dict<string, vec<string>> {
-    $attributes = dict[];
-    if ($this->isOverride) {
-      $attributes['__Override'] = vec[];
-    }
-    if ($this->isMemoized) {
-      $attributes['__Memoize'] = vec[];
-    }
-    return $attributes;
-  }
-
-  private function getFunctionDeclaration(): string {
-    // $keywords is shared by both single and multi line declaration
-    $keywords = (new HackBuilder($this->config))
-      ->addIf($this->isAsync, 'async ')
-      ->add('function ')
-      ->getCode();
-
-    return $this->getFunctionDeclarationBase($keywords);
-  }
-
-  public function appendToBuilder(HackBuilder $builder): HackBuilder {
-    $func_declaration = $this->getFunctionDeclaration();
-    return $this->appendToBuilderBase($builder, $func_declaration);
-  }
-}
+RUN  sed -e 's;^# \(%wheel.*NOPASSWD.*\);\1;g' -i /etc/sudoers
+RUN adduser userbot --disabled-password --home /home/userbot
+RUN adduser userbot wheel
+USER userbot
+RUN mkdir /home/userbot/userbot
+RUN git clone -b master https://github.com/baalajimaestro/Telegram-UserBot /home/userbot/userbot
+WORKDIR /home/userbot/userbot
+#
+#Copies session and config(if it exists)
+#
+COPY ./userbot.session ./config.env* /home/userbot/userbot/
+#
+# Install requirements
+#
+RUN sudo pip3 install -U pip
+RUN sudo pip3 install -r requirements.txt
+RUN sudo chown -R userbot /home/userbot/userbot
+RUN sudo chmod -R 777 /home/userbot/userbot
+CMD ["python3","-m","userbot"]
